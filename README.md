@@ -29,6 +29,12 @@ misc:
 2) Run it
 ```
 nohup python3 luxmedSnip.py -c /path/to/my_favourite_surgeon.yml &
+
+cd Documents/source/LuxmedSniper
+source ~/documents/source/LuxmedSniper/env/bin/activate
+nohup python3 luxmedSnip.py -c christine-ginecologist.yaml -d 600
+nohup python3 luxmedSnip.py -c christine-psycho.yaml -d 300
+python3 luxmedSnip.py -c dermatologist.yaml -d 300
 ```
 3) Wait for new appointment notifications in your pushover app on mobile :)!
 
