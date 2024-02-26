@@ -24,7 +24,10 @@ CUSTOM_USER_AGENT = f"Patient Portal; {APP_VERSION}; {str(uuid.uuid4())}; Androi
 class LuxMedSniper:
     LUXMED_TOKEN_URL = 'https://portalpacjenta.luxmed.pl/PatientPortalMobileAPI/api/token'
     LUXMED_LOGIN_URL = 'https://portalpacjenta.luxmed.pl/PatientPortal/Account/LogInToApp'
-    NEW_PORTAL_RESERVATION_URL = 'https://portalpacjenta.luxmed.pl/PatientPortal/NewPortal/terms/index'
+    REGULAR_RESERVATION_URL = 'https://portalpacjenta.luxmed.pl/PatientPortal/NewPortal/terms/index'
+    SERVICE_DICTIONARY_URL = 'https://portalpacjenta.luxmed.pl/PatientPortal/NewPortal/Dictionary/serviceVariantsGroups'
+    MAX_SEARCH_DAYS_URL = 'https://portalpacjenta.luxmed.pl/PatientPortal/NewPortal/terms/GetMaxSearchDays'
+    ONE_DAY_TERMS_RESERVATION_URL = 'https://portalpacjenta.luxmed.pl/PatientPortal/NewPortal/terms/oneDayTerms'
 
     def __init__(self, configuration_file="luxmedSniper.yaml"):
         self.log = logging.getLogger("LuxMedSniper")
@@ -94,10 +97,54 @@ class LuxMedSniper:
 
         self.log.info('Successfully logged in!')
 
-    def _parseVisitsNewPortal(self, data) -> List[dict]:
+    def _getMaxSearchDays(self, cityId, serviceId) -> int:
+        params = {
+            "cityId": cityId,
+            "serviceVariantId": serviceId,
+            "isDelocalized": True
+        }
+
+        response = self.session.get(LuxMedSniper.MAX_SEARCH_DAYS_URL, params=params)
+
+        max = int(self.config['luxmedsniper']['lookup_time_days']);
+
+        if response.content is None :
+            return max
+        
+        received = int(response.content)
+
+        if received > max:
+            return max
+        
+        return received
+    
+    # 1 - konsultacja
+    # 2 - konsultacja telefoniczna
+    # 3 - badanie
+    # 4 - inne
+    def _getServiceType(self, serviceId) -> int:
+        response = self.session.get(LuxMedSniper.SERVICE_DICTIONARY_URL)
+
+        content = response.json()
+
+        for group in content:
+            if group['name'].lower() == 'Konsultacje'.lower():
+                for service in group['children']:
+                    if str(service['id']) == serviceId:
+                        if service['isTelemedicine'] == False:
+                            return 1
+                        else:
+                            return 2
+            elif group['name'].lower() == 'Badania'.lower():
+                for subgroup in group['children']:
+                    for service in subgroup['children']:
+                        if str(service['id']) == serviceId:
+                            return 3
+            else:
+                return 4
+
+    def _parseRegularVisits(self, data, clinicIdsStr, doctorIdsStr) -> List[dict]:
         appointments = []
-        (clinicIdsStr, doctorIdsStr) = self.config['luxmedsniper'][
-            'doctor_locator_id'].strip().split('*')[-2:]
         content = data.json()
         for termForDay in content["termsForService"]["termsForDays"]:
             for term in termForDay["terms"]:
@@ -118,15 +165,33 @@ class LuxMedSniper:
                     }
                 )
         return appointments
+    
+    def _parseOneDayVisits(self, data, clinicIdsStr, doctorIdsStr) -> List[dict]:
+        appointments = []
+        content = data.json()
+        for term in content["termsForDay"]["terms"]:
+            doctor = term['doctor']
 
-    def _getAppointmentsNewPortal(self):
-        try:
-            (cityId, serviceId, clinicIds, doctorIds) = self.config['luxmedsniper'][
-                'doctor_locator_id'].strip().split('*')
-        except ValueError:
-            raise Exception('DoctorLocatorID seems to be in invalid format')
-        date_to = (datetime.date.today() + datetime.timedelta(
-            days=self.config['luxmedsniper']['lookup_time_days']))
+            if doctorIdsStr != '-1' and not any(x == str(doctor['id']) for x in doctorIdsStr.split(',')):
+                continue
+            if clinicIdsStr != '-1' and not any(x == str(term['clinicId']) for x in clinicIdsStr.split(',')):
+                continue
+
+            appointments.append(
+                {
+                    # don't have doctor details and clinic public name
+                    'AppointmentDate': term['dateTimeFrom'],
+                    'ClinicId': term['clinicId'],
+                    'ClinicPublicName': 'one-day-term' if term['clinic'] is None else term['clinic'],
+                    'DoctorName': f'{doctor["id"]}' if doctor['firstName'] is None else f'{doctor["academicTitle"]} {doctor["firstName"]} {doctor["lastName"]}',
+                    'ServiceId': term['serviceId']
+                }
+            )
+        return appointments
+
+    def _getRegularAppointments(self, searchDays, cityId, serviceId, clinicIds, doctorIds):
+
+        date_to = (datetime.date.today() + datetime.timedelta(days=searchDays))
         params = {
             "searchPlace.id": cityId,
             "searchPlace.type": 0,
@@ -141,13 +206,71 @@ class LuxMedSniper:
         if doctorIds != '-1':
             params['doctorsIds'] = doctorIds.split(',')
 
-        response = self.session.get(LuxMedSniper.NEW_PORTAL_RESERVATION_URL, params=params)
+        response = self.session.get(LuxMedSniper.REGULAR_RESERVATION_URL, params=params)
         return [*filter(
             lambda a: datetime.datetime.fromisoformat(a['AppointmentDate']).date() <= date_to,
-            self._parseVisitsNewPortal(response))]
+            self._parseRegularVisits(response, clinicIds, doctorIds))]
+    
+    def _getOneDayAppointments(self, searchDays, cityId, serviceId, clinicIds, doctorIds):
+
+        appointments = []
+
+        # process day-by-day
+        for i in range (0, searchDays):
+            date = datetime.date.today() + datetime.timedelta(days=i)
+            dateStr = date.strftime("%Y-%m-%d")
+
+            params = {
+                "searchPlace.id": cityId,
+                "searchPlace.type": 0,
+                "serviceVariantId": serviceId,
+                "languageId": 10,
+                "searchDateFrom": dateStr,
+                "searchDateTo": dateStr,
+                "delocalized": False,
+                "searchByMedicalSpecialist": False,
+                "expectedTermsNumber": 2000
+            }
+            if clinicIds != '-1':
+                params['facilitiesIds'] = clinicIds.split(',')
+            if doctorIds != '-1':
+                params['doctorsIds'] = doctorIds.split(',')
+
+            response = self.session.get(LuxMedSniper.ONE_DAY_TERMS_RESERVATION_URL, params=params)
+
+            if response.status_code != 200:
+                continue
+
+            result = [*filter(
+            lambda a: datetime.datetime.fromisoformat(a['AppointmentDate']).date() <= date,
+            self._parseOneDayVisits(response, clinicIds, doctorIds))]
+
+            appointments.extend(result)
+
+            time.sleep(30)
+
+        return appointments
+
 
     def check(self):
-        appointments = self._getAppointmentsNewPortal()
+        try:
+            (cityId, serviceId, clinicIds, doctorIds) = self.config['luxmedsniper'][
+                'doctor_locator_id'].strip().split('*')
+        except ValueError:
+            raise Exception('DoctorLocatorID seems to be in invalid format')
+        
+        searchDays = self._getMaxSearchDays(cityId, serviceId)
+        appointmentType = self._getServiceType(serviceId)
+
+        self.log.info('Looking for ' + str(searchDays) + ' days from now for a ' + ('regular' if appointmentType == 1 or appointmentType == 3 else 'one-day') + ' appointment')
+
+        appointments = []
+        
+        if appointmentType == 1 or appointmentType == 3:
+            appointments = self._getRegularAppointments(searchDays, cityId, serviceId, clinicIds, doctorIds)
+        else:
+            appointments = self._getOneDayAppointments(searchDays, cityId, serviceId, clinicIds, doctorIds)
+
         if not appointments:
             self.log.info("No appointments found.")
             return
@@ -265,7 +388,7 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "-d", "--delay",
-        type=int, help="Delay in fetching updates [s]", default=1800
+        type=int, help="Delay in fetching updates [s]", default=300
     )
     args = parser.parse_args()
     work(args.config)
@@ -273,3 +396,4 @@ if __name__ == "__main__":
     while True:
         schedule.run_pending()
         time.sleep(1)
+ 
